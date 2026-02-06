@@ -1,0 +1,421 @@
+---
+title: "Polysome Profile Normalization Diagnostic"
+format: html
+---
+
+## Overview
+
+This document visualizes the normalization of polysome profiles from sucrose gradient ultracentrifugation experiments. Polysome profiling measures RNA distribution in lysed yeast cells; since ribosomes contain most cellular RNA, the signal primarily reflects ribosome distribution.
+
+### Profile Structure
+
+- **0-12mm**: Free fraction (variable, often dominant)
+- **~10-15mm**: 40S ribosomal subunit (often weak)
+- **~18-22mm**: 60S ribosomal subunit
+- **~25-30mm**: 80S monosome
+- **35-60mm**: Polysomes (disome, trisome, etc.)
+- **>60mm**: Poor peak resolution
+- **>85mm**: Artifacts (excluded)
+
+### Normalization Approach (v4 Platosome-Guided Detection)
+
+The v4 approach uses the **Platosome** - a Platonic (idealized) polysome profile model that serves as a prior for peak identification and quantification.
+
+**Platosome Structure:**
+
+- Positions encoded relative to ruler (free=0, 80S=1)
+- Each peak has: expected position ± SD, shape parameters, relative amplitude, detection rate
+- Estimated from empirical data, used to guide detection
+
+**Detection Layers:**
+
+1. **Primary Landmarks** (no priors): Free and 80S peaks define the ruler
+2. **Trough Detection**: Post-80S trough marks polysome boundary
+3. **Platosome-Guided Detection**: Search for peaks within prior-defined bounds
+4. **Inference**: Place missing peaks at expected positions with reduced confidence
+
+**Confidence Levels:**
+
+- `detected` (confidence=1.0): Peak clearly found
+- `weak` (confidence=0.7): Peak found but low prominence
+- `inferred` (confidence=0.4): Peak placed from platosome prior
+
+**Normalization:**
+
+- X-axis: Affine transform anchored on free and 80S (scale + offset)
+- Y-axis: Scale by total area under curve
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidyverse)
+library(sn)
+library(jsonlite)
+
+# Load data
+data <- read_tsv("../data/normalized_profiles.tsv", show_col_types = FALSE)
+fits <- read_tsv("../data/normalized_profiles_fits.tsv", show_col_types = FALSE)
+
+# Load platosome
+platosome <- fromJSON("../data/platosome.json")
+
+# Define peak colors
+peak_colors <- c(
+  "free" = "#E41A1C",
+  "40S" = "#FF7F00",
+  "60S" = "#4DAF4A",
+  "80S" = "#377EB8",
+  "2-some" = "#984EA3",
+  "3-some" = "#A65628",
+  "4-some" = "#F781BF",
+  "5-some" = "#999999",
+  "6-some" = "#666666"
+)
+
+cat(sprintf("Loaded %d samples with %d total peak fits\n",
+            n_distinct(fits$identifier), nrow(fits)))
+```
+
+## Platosome Prior
+
+The platosome defines expected peak positions relative to the ruler (free-to-80S distance).
+
+```{r}
+#| label: platosome-summary
+#| fig-width: 12
+#| fig-height: 5
+
+# Extract platosome peak data
+platosome_peaks <- tibble(
+  peak = names(platosome$peaks),
+  pos_rel = map_dbl(platosome$peaks, "position_relative"),
+  pos_sd = map_dbl(platosome$peaks, "position_sd"),
+  amplitude = map_dbl(platosome$peaks, "amplitude_relative"),
+  detection = map_dbl(platosome$peaks, "detection_rate")
+) |>
+  arrange(pos_rel) |>
+  mutate(
+    peak = factor(peak, levels = peak),
+    pos_abs = pos_rel * platosome$ruler_mean,
+    pos_lo = (pos_rel - 2*pos_sd) * platosome$ruler_mean,
+    pos_hi = (pos_rel + 2*pos_sd) * platosome$ruler_mean
+  )
+
+# Platosome visualization
+ggplot(platosome_peaks, aes(x = pos_abs, y = amplitude, fill = peak)) +
+  geom_errorbarh(aes(xmin = pos_lo, xmax = pos_hi), height = 0.05, alpha = 0.5) +
+  geom_point(size = 4, shape = 21, color = "black") +
+  geom_text(aes(label = sprintf("%.0f%%", detection * 100)),
+            vjust = -1.5, size = 3) +
+  scale_fill_manual(values = peak_colors) +
+  labs(
+    x = sprintf("Position (mm, at mean ruler = %.1f mm)", platosome$ruler_mean),
+    y = "Relative amplitude (80S = 1)",
+    title = "Platosome: Expected Peak Structure",
+    subtitle = sprintf("Estimated from %d samples; error bars = ±2 SD; percentages = detection rates",
+                       platosome$n_samples)
+  ) +
+  coord_cartesian(xlim = c(0, 65), ylim = c(0, 5)) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+```{r}
+#| label: platosome-table
+
+platosome_peaks |>
+  select(peak, pos_rel, pos_sd, amplitude, detection) |>
+  mutate(
+    `Position (rel)` = sprintf("%.3f ± %.3f", pos_rel, pos_sd),
+    `Amplitude (rel)` = sprintf("%.2f", amplitude),
+    `Detection` = sprintf("%.0f%%", detection * 100)
+  ) |>
+  select(Peak = peak, `Position (rel)`, `Amplitude (rel)`, `Detection`) |>
+  knitr::kable(caption = "Platosome peak priors (position relative to ruler: free=0, 80S=1)")
+```
+
+## Detection Summary
+
+```{r}
+#| label: detection-summary
+
+# Summary by peak
+detection_summary <- fits |>
+  group_by(peak) |>
+  summarise(
+    n = n(),
+    detected = sum(method == "detected"),
+    inferred = sum(method == "inferred"),
+    pct_detected = detected / n * 100,
+    mean_confidence = mean(confidence),
+    .groups = "drop"
+  ) |>
+  arrange(factor(peak, levels = names(peak_colors)))
+
+detection_summary |>
+  mutate(
+    `Detection Rate` = sprintf("%.0f%% (%d/%d)", pct_detected, detected, n),
+    `Inferred` = inferred,
+    `Mean Confidence` = sprintf("%.2f", mean_confidence)
+  ) |>
+  select(Peak = peak, `Detection Rate`, Inferred, `Mean Confidence`) |>
+  knitr::kable(caption = "Peak detection summary across all samples")
+```
+
+## Raw Peak Positions
+
+Vertical bars show detected peak positions on the **unnormalized** data. Solid lines = detected, dashed = inferred from platosome.
+
+```{r}
+#| label: raw-peaks
+#| fig-width: 12
+#| fig-height: 8
+
+ggplot() +
+  geom_line(data = data,
+            aes(x = distance, y = absorbance, group = identifier),
+            alpha = 0.2, linewidth = 0.2, color = "gray40") +
+  geom_vline(data = fits |> filter(peak %in% names(peak_colors)),
+             aes(xintercept = mode, color = peak,
+                 linetype = ifelse(method == "inferred", "inferred", "detected")),
+             alpha = 0.4, linewidth = 0.4) +
+  scale_color_manual(values = peak_colors, name = "Peak") +
+  scale_linetype_manual(values = c("detected" = "solid", "inferred" = "dashed"),
+                        name = "Method") +
+  labs(
+    x = "Distance (mm)",
+    y = "Absorbance (254 nm)",
+    title = "Raw Profiles with Peak Positions",
+    subtitle = sprintf("%d samples; solid = detected, dashed = inferred", n_distinct(data$identifier))
+  ) +
+  coord_cartesian(xlim = c(0, 70)) +
+  theme_classic()
+```
+
+## Peak Position Variability
+
+Distribution of peak positions (raw) across all samples, now including 40S.
+
+```{r}
+#| label: peak-scatter
+#| fig-width: 12
+#| fig-height: 5
+
+key_peaks <- c("free", "40S", "60S", "80S", "2-some", "3-some")
+
+fits |>
+  filter(peak %in% key_peaks) |>
+  mutate(peak = factor(peak, levels = key_peaks)) |>
+  ggplot(aes(x = peak, y = mode, color = peak, shape = method)) +
+  geom_jitter(width = 0.2, alpha = 0.6, size = 2) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  scale_color_manual(values = peak_colors) +
+  scale_shape_manual(values = c("detected" = 16, "inferred" = 1)) +
+  labs(
+    x = "Peak",
+    y = "Position (mm)",
+    title = "Peak Position Variability Across Samples",
+    subtitle = "Filled = detected, hollow = inferred; crossbar = mean"
+  ) +
+  theme_classic() +
+  theme(legend.position = "right")
+```
+
+## 40S Detection Region
+
+The 40S peak is often weak. The platosome guides detection to the expected region.
+
+```{r}
+#| label: 40S-region
+#| fig-width: 12
+#| fig-height: 6
+
+# Zoom to 40S region
+ggplot() +
+  geom_line(data = data,
+            aes(x = distance, y = absorbance, group = identifier),
+            alpha = 0.2, linewidth = 0.3, color = "gray40") +
+  geom_vline(data = fits |> filter(peak == "40S"),
+             aes(xintercept = mode,
+                 linetype = ifelse(method == "inferred", "inferred", "detected")),
+             color = peak_colors["40S"], alpha = 0.6, linewidth = 0.6) +
+  scale_linetype_manual(values = c("detected" = "solid", "inferred" = "dashed"),
+                        name = "Method") +
+  labs(
+    x = "Distance (mm)",
+    y = "Absorbance (254 nm)",
+    title = "40S Peak Detection",
+    subtitle = sprintf("40S detected in %d samples, inferred in %d samples",
+                       sum(fits$peak == "40S" & fits$method == "detected"),
+                       sum(fits$peak == "40S" & fits$method == "inferred"))
+  ) +
+  coord_cartesian(xlim = c(5, 25)) +
+  theme_classic()
+```
+
+## Normalized Profiles
+
+After affine transformation anchored on free and 80S peaks.
+
+```{r}
+#| label: normalized
+#| fig-width: 12
+#| fig-height: 8
+
+# Get reference peak positions
+ref_fit <- fits |> filter(identifier == unique(fits$identifier)[1])
+ref_free <- ref_fit |> filter(peak == "free") |> pull(mode)
+ref_80s <- ref_fit |> filter(peak == "80S") |> pull(mode)
+ref_distance <- ref_80s - ref_free
+
+# Compute normalized peak positions
+fits_normalized <- fits |>
+  group_by(identifier) |>
+  mutate(
+    src_free = mode[peak == "free"][1],
+    src_80s = mode[peak == "80S"][1],
+    src_distance = src_80s - src_free,
+    scale = ref_distance / src_distance,
+    offset = ref_free - src_free * scale,
+    mode.normalized = mode * scale + offset
+  ) |>
+  ungroup()
+
+ggplot() +
+  geom_line(data = data,
+            aes(x = distance.normalized, y = absorbance.normalized, group = identifier),
+            alpha = 0.2, linewidth = 0.2, color = "steelblue") +
+  geom_vline(data = fits_normalized |> filter(peak %in% names(peak_colors)),
+             aes(xintercept = mode.normalized, color = peak,
+                 linetype = ifelse(method == "inferred", "inferred", "detected")),
+             alpha = 0.4, linewidth = 0.4) +
+  scale_color_manual(values = peak_colors, name = "Peak") +
+  scale_linetype_manual(values = c("detected" = "solid", "inferred" = "dashed"),
+                        name = "Method") +
+  labs(
+    x = "Distance (mm, normalized)",
+    y = "Absorbance (normalized)",
+    title = "Normalized Profiles with Peak Positions",
+    subtitle = "Affine transform: free and 80S aligned; dashed = inferred peaks"
+  ) +
+  coord_cartesian(xlim = c(0, 70)) +
+  theme_classic()
+```
+
+## Normalized Peak Position Summary
+
+After normalization, peak positions should be tightly clustered.
+
+```{r}
+#| label: normalized-scatter
+#| fig-width: 12
+#| fig-height: 5
+
+fits_normalized |>
+  filter(peak %in% key_peaks) |>
+  mutate(peak = factor(peak, levels = key_peaks)) |>
+  ggplot(aes(x = peak, y = mode.normalized, color = peak, shape = method)) +
+  geom_jitter(width = 0.2, alpha = 0.6, size = 2) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black") +
+  scale_color_manual(values = peak_colors) +
+  scale_shape_manual(values = c("detected" = 16, "inferred" = 1)) +
+  labs(
+    x = "Peak",
+    y = "Position (mm, normalized)",
+    title = "Normalized Peak Positions",
+    subtitle = "Free and 80S are anchors; other peaks show residual variability"
+  ) +
+  theme_classic() +
+  theme(legend.position = "right")
+
+# Table of normalized position statistics
+fits_normalized |>
+  filter(peak %in% key_peaks) |>
+  group_by(peak) |>
+  summarise(
+    mean = mean(mode.normalized),
+    sd = sd(mode.normalized),
+    .groups = "drop"
+  ) |>
+  mutate(peak = factor(peak, levels = key_peaks)) |>
+  arrange(peak) |>
+  knitr::kable(digits = 2, caption = "Normalized peak position statistics (mm)")
+```
+
+## Example Peak Fit
+
+```{r}
+#| label: example-fit
+#| fig-width: 12
+#| fig-height: 6
+
+# Select first profile
+example_id <- unique(fits$identifier)[1]
+example_data <- data |> filter(identifier == example_id)
+example_fits <- fits |> filter(identifier == example_id)
+
+# Skew-normal PDF with baseline
+skewnorm_pdf <- function(x, amplitude, location, scale, skewness, baseline) {
+  baseline + amplitude * sn::dsn(x, xi = location, omega = scale, alpha = skewness)
+}
+
+# Generate fitted curves
+x_grid <- seq(0, 70, by = 0.1)
+fitted_components <- tibble(distance = x_grid)
+
+for (i in 1:nrow(example_fits)) {
+  p <- example_fits[i, ]
+  component <- skewnorm_pdf(x_grid, p$amplitude, p$location, p$scale, p$skewness, p$baseline)
+  fitted_components[[p$peak]] <- component
+}
+
+fitted_long <- fitted_components |>
+  pivot_longer(-distance, names_to = "peak", values_to = "fitted") |>
+  left_join(example_fits |> select(peak, method, confidence), by = "peak")
+
+ggplot() +
+  geom_line(data = example_data, aes(x = distance, y = absorbance),
+            color = "black", linewidth = 0.5) +
+  geom_line(data = fitted_long |> filter(peak %in% names(peak_colors)),
+            aes(x = distance, y = fitted, color = peak,
+                linetype = ifelse(method == "inferred", "inferred", "detected")),
+            linewidth = 0.6, alpha = 0.8) +
+  geom_vline(data = example_fits, aes(xintercept = mode),
+             color = "gray50", linetype = "dotted", alpha = 0.5) +
+  scale_color_manual(values = peak_colors, name = "Peak") +
+  scale_linetype_manual(values = c("detected" = "solid", "inferred" = "dashed"),
+                        guide = "none") +
+  labs(
+    x = "Distance (mm)",
+    y = "Absorbance (254 nm)",
+    title = paste("Peak Fits:", example_id),
+    subtitle = "Dashed = inferred peaks"
+  ) +
+  coord_cartesian(xlim = c(0, 70)) +
+  theme_classic()
+```
+
+## Confidence Distribution
+
+The confidence field indicates how reliably each peak was identified.
+
+```{r}
+#| label: confidence-dist
+#| fig-width: 10
+#| fig-height: 5
+
+fits |>
+  filter(peak %in% key_peaks) |>
+  mutate(peak = factor(peak, levels = key_peaks)) |>
+  ggplot(aes(x = peak, y = confidence, fill = method)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("detected" = "steelblue", "inferred" = "coral")) +
+  labs(
+    x = "Peak",
+    y = "Confidence",
+    title = "Detection Confidence by Peak",
+    subtitle = "1.0 = strong detection, 0.7 = weak, 0.4 = inferred from platosome"
+  ) +
+  theme_classic()
+```

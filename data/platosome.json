@@ -1,0 +1,117 @@
+{
+  "version": "1.0",
+  "n_samples": 39,
+  "description": "Estimated from 39 polysome profiles",
+  "ruler_mean": 24.533406779717332,
+  "ruler_sd": 2.271754878803981,
+  "peaks": {
+    "free": {
+      "position_relative": 0.0,
+      "position_sd": 0.0,
+      "scale": 3.1185585187084146,
+      "scale_sd": 0.6538358972684486,
+      "skewness": 4.526066015486041,
+      "skewness_sd": 1.5024622727354402,
+      "amplitude_relative": 4.36790877823834,
+      "amplitude_cv": 0.3362192229628006,
+      "detection_rate": 1.0,
+      "is_anchor": true
+    },
+    "40S": {
+      "position_relative": 0.41214906653451394,
+      "position_sd": 0.03492883142984569,
+      "scale": 3.987413318277037,
+      "scale_sd": 0.078603802166371,
+      "skewness": -1.766715481574609,
+      "skewness_sd": 1.3029205238418167,
+      "amplitude_relative": 0.25337744475303514,
+      "amplitude_cv": 0.2942339700829396,
+      "detection_rate": 1.0,
+      "is_anchor": false
+    },
+    "60S": {
+      "position_relative": 0.7590560419942519,
+      "position_sd": 0.029442510348141753,
+      "scale": 2.494924235686079,
+      "scale_sd": 1.022134138108998,
+      "skewness": 3.3585654951989024,
+      "skewness_sd": 1.5689773386369907,
+      "amplitude_relative": 0.251427267757399,
+      "amplitude_cv": 0.271640195524268,
+      "detection_rate": 1.0,
+      "is_anchor": false
+    },
+    "80S": {
+      "position_relative": 1.0,
+      "position_sd": 0.0,
+      "scale": 2.1860187119458296,
+      "scale_sd": 0.32895982170202615,
+      "skewness": 4.174229970417397,
+      "skewness_sd": 0.5127822250696804,
+      "amplitude_relative": 1.0,
+      "amplitude_cv": 0.0,
+      "detection_rate": 1.0,
+      "is_anchor": true
+    },
+    "2-some": {
+      "position_relative": 1.3731684084882327,
+      "position_sd": 0.04434982174867535,
+      "scale": 2.589030666987393,
+      "scale_sd": 1.1780183108776618,
+      "skewness": -0.36047396231147805,
+      "skewness_sd": 3.0644951772552327,
+      "amplitude_relative": 0.21661493904246557,
+      "amplitude_cv": 0.37324389003641817,
+      "detection_rate": 1.0,
+      "is_anchor": false
+    },
+    "3-some": {
+      "position_relative": 1.6752635718806586,
+      "position_sd": 0.03765516858896254,
+      "scale": 1.9590055303575304,
+      "scale_sd": 0.7253311667605931,
+      "skewness": 2.5643179481089438,
+      "skewness_sd": 2.709513958749288,
+      "amplitude_relative": 0.22111146493050682,
+      "amplitude_cv": 0.46684369028214784,
+      "detection_rate": 1.0,
+      "is_anchor": false
+    },
+    "4-some": {
+      "position_relative": 1.940190269113749,
+      "position_sd": 0.05268263410569371,
+      "scale": 1.7273280965623667,
+      "scale_sd": 1.0916007726330548,
+      "skewness": 2.8971563497600097,
+      "skewness_sd": 1.693513155666779,
+      "amplitude_relative": 0.23251523521721942,
+      "amplitude_cv": 0.4873373658041765,
+      "detection_rate": 1.0,
+      "is_anchor": false
+    },
+    "5-some": {
+      "position_relative": 2.21790212714343,
+      "position_sd": 0.07714277027459611,
+      "scale": 2.8735947276986855,
+      "scale_sd": 1.4492769289111964,
+      "skewness": 1.878606911395521,
+      "skewness_sd": 1.788158105349796,
+      "amplitude_relative": 0.2294134247128347,
+      "amplitude_cv": 0.5542979571745374,
+      "detection_rate": 0.8717948717948718,
+      "is_anchor": false
+    },
+    "6-some": {
+      "position_relative": 2.545488037490616,
+      "position_sd": 0.07742660298008981,
+      "scale": 3.912620123871605,
+      "scale_sd": 0.1723121402396727,
+      "skewness": -0.5320336147464215,
+      "skewness_sd": 1.3271333429141354,
+      "amplitude_relative": 0.24807205010791245,
+      "amplitude_cv": 0.77933474604893,
+      "detection_rate": 0.48717948717948717,
+      "is_anchor": false
+    }
+  }
+}
