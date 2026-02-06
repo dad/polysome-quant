@@ -377,16 +377,26 @@ def fit_single_peak(distance, absorbance, peak_position, window_mm=FIT_WINDOW_MM
         height = skewnorm_with_baseline(mode, amplitude, loc, scale, skewness, baseline)
         fwhm = 2.355 * scale * (1 + 0.1 * abs(skewness))
 
+        # Compute goodness of fit
+        y_fitted = skewnorm_with_baseline(x, amplitude, loc, scale, skewness, baseline)
+        ss_res = np.sum((y - y_fitted) ** 2)
+        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
         return {
             'amplitude': amplitude, 'location': loc, 'scale': scale,
             'skewness': skewness, 'baseline': baseline,
-            'mode': mode, 'height': height, 'fwhm': fwhm
+            'mode': mode, 'height': height, 'fwhm': fwhm,
+            'r_squared': r_squared,
+            'window_x': x, 'window_y': y,
         }
     except (RuntimeError, ValueError):
         return {
             'amplitude': np.max(y) - np.min(y), 'location': peak_position,
             'scale': 1.5, 'skewness': 0.0, 'baseline': np.min(y),
-            'mode': peak_position, 'height': np.max(y), 'fwhm': 3.0
+            'mode': peak_position, 'height': np.max(y), 'fwhm': 3.0,
+            'r_squared': 0.0,
+            'window_x': x, 'window_y': y,
         }
 
 
@@ -498,7 +508,7 @@ def process_profile(distance, absorbance, platosome, ref_peaks, ref_area,
         'peak': peak_labels
     })
 
-    # Build fits dataframe (with confidence and method)
+    # Build fits dataframe (with confidence, method, and r_squared)
     fits_data = []
     for label, peak in labeled_peaks.items():
         fits_data.append({
@@ -513,7 +523,8 @@ def process_profile(distance, absorbance, platosome, ref_peaks, ref_area,
             'height': peak['height'],
             'fwhm': peak['fwhm'],
             'confidence': peak['confidence'],
-            'method': peak['method']
+            'method': peak['method'],
+            'r_squared': peak.get('r_squared'),
         })
 
     fits_df = pd.DataFrame(fits_data)
@@ -590,7 +601,13 @@ def parse_raw_file(filepath):
 
 
 def normalize_profiles(file_list, platosome, verbose=False):
-    """Normalize multiple polysome profiles using platosome priors."""
+    """Normalize multiple polysome profiles using platosome priors.
+
+    Returns:
+        (profiles_df, fits_df, peak_windows, profile_data)
+        peak_windows: dict for template estimation
+        profile_data: list for envelope estimation
+    """
     profiles = []
     for filepath in file_list:
         path = Path(filepath)
@@ -641,26 +658,51 @@ def normalize_profiles(file_list, platosome, verbose=False):
     print(f"  Reference peaks: {', '.join(peak_list)}", file=sys.stderr)
     print(f"  Ruler: {ruler:.2f} mm", file=sys.stderr)
 
-    # Process all profiles
+    # Process all profiles, accumulating data for platosome estimation
     all_results = []
     all_fits = []
+    peak_windows = {}   # {peak_name: [(window_x, window_y, fit_params, ruler), ...]}
+    profile_data = []   # [(distance, absorbance, labeled_peaks, ruler, free_pos), ...]
 
     for profile in profiles:
         df = profile['data']
         identifier = profile['identifier']
+        dist_arr = df['distance'].values
+        abs_arr = df['absorbance'].values
 
         result_df, fits_df, labeled_peaks, x_scale, x_offset, y_scale = process_profile(
-            df['distance'].values,
-            df['absorbance'].values,
-            platosome,
-            ref_peaks,
-            ref_area,
-            identifier,
-            verbose=verbose
+            dist_arr, abs_arr, platosome, ref_peaks, ref_area,
+            identifier, verbose=verbose
         )
 
         if result_df is None:
             continue
+
+        # Compute ruler for this profile
+        profile_ruler = None
+        profile_free_pos = None
+        if 'free' in labeled_peaks and '80S' in labeled_peaks:
+            profile_free_pos = labeled_peaks['free']['mode']
+            profile_ruler = labeled_peaks['80S']['mode'] - profile_free_pos
+
+        # Accumulate peak window data for template estimation
+        if profile_ruler and profile_ruler > 0:
+            for peak_name, peak_fit in labeled_peaks.items():
+                if 'window_x' in peak_fit and 'window_y' in peak_fit:
+                    if peak_name not in peak_windows:
+                        peak_windows[peak_name] = []
+                    peak_windows[peak_name].append((
+                        peak_fit['window_x'],
+                        peak_fit['window_y'],
+                        peak_fit,
+                        profile_ruler
+                    ))
+
+            # Accumulate profile data for envelope estimation
+            profile_data.append((
+                dist_arr, abs_arr, labeled_peaks,
+                profile_ruler, profile_free_pos
+            ))
 
         n_detected = sum(1 for p in labeled_peaks.values() if p.get('method') == 'detected')
         n_inferred = sum(1 for p in labeled_peaks.values() if p.get('method') == 'inferred')
@@ -672,7 +714,10 @@ def normalize_profiles(file_list, platosome, verbose=False):
         all_results.append(result_df)
         all_fits.append(fits_df)
 
-    return pd.concat(all_results, ignore_index=True), pd.concat(all_fits, ignore_index=True)
+    combined_results = pd.concat(all_results, ignore_index=True)
+    combined_fits = pd.concat(all_fits, ignore_index=True)
+
+    return combined_results, combined_fits, peak_windows, profile_data
 
 
 def main():
@@ -686,6 +731,8 @@ def main():
                         help='Platosome JSON file')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Print detailed detection information')
+    parser.add_argument('--estimate-platosome', metavar='OUTPUT_JSON',
+                        help='Also estimate platosome v2 from the processed data')
 
     args = parser.parse_args()
 
@@ -705,7 +752,9 @@ def main():
         if not Path(f).exists():
             parser.error(f"File not found: {f}")
 
-    profiles_df, fits_df = normalize_profiles(args.files, platosome, verbose=args.verbose)
+    profiles_df, fits_df, peak_windows, profile_data = normalize_profiles(
+        args.files, platosome, verbose=args.verbose
+    )
 
     profiles_df.to_csv(args.output, sep='\t', index=False)
     print(f"\nWrote {len(profiles_df)} rows to {args.output}", file=sys.stderr)
@@ -713,6 +762,17 @@ def main():
     fits_output = args.output.replace('.tsv', '_fits.tsv')
     fits_df.to_csv(fits_output, sep='\t', index=False)
     print(f"Wrote {len(fits_df)} peak fits to {fits_output}", file=sys.stderr)
+
+    # Estimate platosome v2 if requested
+    if args.estimate_platosome:
+        from platosome import estimate_platosome_v2
+        print(f"\nEstimating platosome v2...", file=sys.stderr)
+        estimate_platosome_v2(
+            fits_filepath=fits_output,
+            peak_windows=peak_windows,
+            profile_data=profile_data,
+            output_filepath=args.estimate_platosome
+        )
 
 
 if __name__ == '__main__':

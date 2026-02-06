@@ -1,0 +1,765 @@
+---
+title: "The Platosome: Principled Polysome Profile Normalization"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    code-fold: true
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+#| include: false
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(sn)
+library(jsonlite)
+
+data <- read_tsv("../data/normalized_profiles.tsv", show_col_types = FALSE)
+fits <- read_tsv("../data/normalized_profiles_fits.tsv", show_col_types = FALSE)
+platosome <- fromJSON("../data/platosome_v2.json")
+
+peak_colors <- c(
+  "free" = "#E41A1C",
+  "40S" = "#FF7F00",
+  "60S" = "#4DAF4A",
+  "80S" = "#377EB8",
+  "2-some" = "#984EA3",
+  "3-some" = "#A65628",
+  "4-some" = "#F781BF",
+  "5-some" = "#888888",
+  "6-some" = "#444444"
+)
+
+peak_order <- c("free", "40S", "60S", "80S", "2-some", "3-some",
+                "4-some", "5-some", "6-some")
+
+theme_set(theme_classic(base_size = 12))
+```
+
+## The Problem
+
+Polysome profiling separates ribosome--mRNA complexes by size on a sucrose density gradient. The output is a trace of UV absorbance (254 nm) against distance along the gradient. Each resolvable peak corresponds to a species of known ribosome count:
+
+- **Free RNA** at the top (low density)
+- **40S** and **60S** ribosomal subunits
+- **80S monosome** (one ribosome per mRNA)
+- **Polysomes**: 2-some (disome), 3-some (trisome), etc.
+
+The ratio of RNA in polysomes to monosomes is the core measurement --- it reflects translational activity. But quantifying this ratio requires comparing profiles across experiments, which means normalizing away technical variation: different sample loading, gradient steepness, and gradient nonlinearity.
+
+```{r}
+#| label: the-problem
+#| fig-width: 11
+#| fig-height: 5
+#| fig-cap: "Raw polysome profiles. Thirty-nine traces from multiple strains, temperatures, and dates. Same biology should give same shapes, but gradient-to-gradient variation obscures comparability."
+
+data |>
+  ggplot(aes(x = distance, y = absorbance, group = identifier)) +
+  geom_line(alpha = 0.25, linewidth = 0.3, color = "gray30") +
+  annotate("text", x = 5, y = max(data$absorbance) * 0.85,
+           label = "Free RNA", hjust = 0, fontface = "italic", color = peak_colors["free"]) +
+  annotate("text", x = 27, y = max(data$absorbance) * 0.3,
+           label = "80S", hjust = 0.5, fontface = "italic", color = peak_colors["80S"]) +
+  annotate("text", x = 45, y = max(data$absorbance) * 0.12,
+           label = "Polysomes", hjust = 0.5, fontface = "italic", color = peak_colors["2-some"]) +
+  annotate("segment", x = 35, xend = 60, y = max(data$absorbance) * 0.10,
+           yend = max(data$absorbance) * 0.10,
+           arrow = arrow(length = unit(0.15, "cm"), ends = "both"),
+           color = peak_colors["2-some"], alpha = 0.5) +
+  labs(x = "Distance along gradient (mm)", y = "Absorbance (254 nm)") +
+  coord_cartesian(xlim = c(0, 75)) +
+  theme(plot.margin = margin(10, 15, 10, 10))
+```
+
+Two things vary between runs:
+
+1. **The x-axis** --- peaks shift left/right because gradients are poured with slightly different slopes.
+2. **The y-axis** --- total signal scales with the amount of lysate loaded.
+
+A further complication: the sucrose gradient is not perfectly linear. Peaks at the heavy end (high polysomes) compress together nonlinearly. A single affine (scale + shift) transform anchored on two landmark peaks cannot correct this everywhere.
+
+## The Platosome
+
+The **Platosome** (Plat*onic* poly*some*) is an idealized reference model of what a polysome profile should look like. It is estimated empirically from `r platosome$n_samples` training profiles and encodes:
+
+- Expected **positions** for each peak, relative to a *ruler* (the free-to-80S distance)
+- **Shape templates** --- the empirical average peak shape, capturing asymmetry and shoulder structure that parametric models (like the skew-normal) miss
+- **Local step ratios** --- how far apart consecutive peaks are, expressed relative to their immediate neighbors, which captures gradient nonlinearity locally
+- A **polysome envelope** --- the typical shape of the entire polysome region, for normalizing where individual peaks can no longer be resolved
+
+The key design choice: positions are encoded in *ruler-relative* units, where free = 0 and 80S = 1. This makes the platosome portable across different gradient conditions.
+
+```{r}
+#| label: platosome-ideal
+#| fig-width: 11
+#| fig-height: 5.5
+#| fig-cap: "The Platosome. Solid curve: the idealized profile generated from skew-normal fits. Colored bands: empirical shape templates (mean +/- 1 SD) from training data. Dashed vertical lines: expected peak positions +/- 2 SD. Faded peaks (5-some, 6-some) are detected in fewer samples."
+
+ruler <- platosome$ruler_mean
+free_pos <- 4.0  # typical free position
+
+# Generate idealized parametric profile
+x_mm <- seq(0, 72, by = 0.1)
+
+# Build each parametric peak
+parametric_total <- rep(0, length(x_mm))
+parametric_components <- list()
+
+for (pname in peak_order) {
+  pk <- platosome$peaks[[pname]]
+  if (is.null(pk)) next
+
+  center <- free_pos + pk$position_relative * ruler  # desired mode position in mm
+  abs_scale <- pk$scale * ruler / 24.5
+  amp <- pk$amplitude_relative
+  alpha <- pk$skewness
+
+  # Skew-normal mode != xi (location). Compute xi so that mode lands at center.
+  # Mode offset: delta * sqrt(2/pi) * omega, where delta = alpha / sqrt(1 + alpha^2)
+  delta <- alpha / sqrt(1 + alpha^2)
+  mode_offset <- delta * sqrt(2 / pi) * abs_scale
+  xi_adjusted <- center - mode_offset
+
+  component <- amp * dsn(x_mm, xi = xi_adjusted, omega = abs_scale, alpha = alpha)
+  parametric_total <- parametric_total + component
+  parametric_components[[pname]] <- tibble(
+    x = x_mm, y = component, peak = pname,
+    detection = pk$detection_rate
+  )
+}
+
+df_param <- tibble(x = x_mm, y = parametric_total)
+df_components <- bind_rows(parametric_components)
+
+# Build empirical template overlays
+template_overlays <- list()
+for (pname in peak_order) {
+  pk <- platosome$peaks[[pname]]
+  if (is.null(pk) || is.null(pk$template_x)) next
+
+  tx <- unlist(pk$template_x)
+  tmean <- unlist(pk$template_mean)
+  tsd <- unlist(pk$template_sd)
+
+  # Replace NULL/NA
+  tmean[sapply(tmean, is.null)] <- NA
+  tsd[sapply(tsd, is.null)] <- NA
+  tmean <- as.numeric(tmean)
+  tsd <- as.numeric(tsd)
+
+  valid <- !is.na(tmean) & !is.na(tsd)
+  if (sum(valid) < 5) next
+
+  # Convert from ruler-relative template coords to absolute mm
+  mode_mm <- free_pos + pk$position_relative * ruler
+  abs_scale_t <- pk$scale * ruler / 24.5
+  alpha_t <- pk$skewness
+
+  # Compute xi so mode lands at mode_mm (same adjustment as parametric curve)
+  delta_t <- alpha_t / sqrt(1 + alpha_t^2)
+  mode_offset_t <- delta_t * sqrt(2 / pi) * abs_scale_t
+  xi_t <- mode_mm - mode_offset_t
+
+  # Evaluate parametric peak height at the actual mode
+  peak_height_profile <- pk$amplitude_relative * dsn(mode_mm, xi = xi_t,
+                                                      omega = abs_scale_t,
+                                                      alpha = alpha_t)
+  if (peak_height_profile < 1e-6) next
+
+  x_abs <- tx * ruler + mode_mm
+  y_mean <- tmean * peak_height_profile
+  y_lo <- (tmean - tsd) * peak_height_profile
+  y_hi <- (tmean + tsd) * peak_height_profile
+
+  template_overlays[[pname]] <- tibble(
+    x = x_abs[valid], y_mean = y_mean[valid],
+    y_lo = y_lo[valid], y_hi = y_hi[valid],
+    peak = pname, detection = pk$detection_rate
+  )
+}
+
+df_templates <- bind_rows(template_overlays)
+
+# Peak position markers
+peak_markers <- tibble(
+  peak = peak_order,
+  pos = free_pos + map_dbl(platosome$peaks[peak_order], "position_relative") * ruler,
+  pos_sd = map_dbl(platosome$peaks[peak_order], "position_sd") * ruler,
+  detection = map_dbl(platosome$peaks[peak_order], "detection_rate"),
+  amp = map_dbl(platosome$peaks[peak_order], "amplitude_relative")
+)
+
+ggplot() +
+  # Empirical template bands
+  geom_ribbon(data = df_templates,
+              aes(x = x, ymin = pmax(y_lo, 0), ymax = y_hi,
+                  fill = peak, alpha = detection),
+              show.legend = FALSE) +
+  # Parametric composite
+  geom_line(data = df_param, aes(x = x, y = y),
+            color = "black", linewidth = 0.6) +
+  # Individual parametric components (faint)
+  geom_line(data = df_components,
+            aes(x = x, y = y, color = peak, alpha = detection),
+            linewidth = 0.4, linetype = "solid", show.legend = FALSE) +
+  # Peak position whiskers
+  geom_segment(data = peak_markers,
+               aes(x = pos - 2 * pos_sd, xend = pos + 2 * pos_sd,
+                   y = -0.015, yend = -0.015, color = peak),
+               linewidth = 1.5, alpha = 0.5, show.legend = FALSE) +
+  geom_point(data = peak_markers,
+             aes(x = pos, y = -0.015, color = peak),
+             size = 2, show.legend = FALSE) +
+  # Peak labels
+  geom_text(data = peak_markers,
+            aes(x = pos, y = -0.035, label = peak, color = peak),
+            size = 3, fontface = "bold", show.legend = FALSE) +
+  scale_color_manual(values = peak_colors) +
+  scale_fill_manual(values = peak_colors) +
+  scale_alpha_continuous(range = c(0.15, 0.35)) +
+  labs(x = sprintf("Distance (mm) at ruler = %.1f mm", ruler),
+       y = "Relative absorbance (80S = 1)") +
+  coord_cartesian(xlim = c(0, 70), ylim = c(-0.05, NA)) +
+  theme(plot.margin = margin(10, 15, 10, 10))
+```
+
+## Training Data: Before and After
+
+### Raw profiles
+
+The `r platosome$n_samples` training profiles come from `r n_distinct(str_extract(fits$identifier, "\\\\d{8}|\\\\d+_\\\\d+_\\\\d+"))` experimental sessions spanning multiple yeast strains (BY4742, BY4741, MV_A, MV_I, yHG005, yHG008) and temperatures (30--46 C). Each profile has `r format(round(mean(table(data$identifier))), big.mark = ",")` data points.
+
+```{r}
+#| label: raw-training
+#| fig-width: 11
+#| fig-height: 5
+#| fig-cap: "All 39 raw training profiles, colored by experimental date (a rough proxy for gradient batch). Peak positions drift between batches; amplitude varies with loading."
+
+# Extract date from identifier for coloring
+data_with_date <- data |>
+  mutate(date = str_extract(identifier, "\\d{8}|\\d+_\\d+_\\d+"))
+
+ggplot(data_with_date, aes(x = distance, y = absorbance,
+                            group = identifier, color = date)) +
+  geom_line(alpha = 0.5, linewidth = 0.3) +
+  scale_color_brewer(palette = "Set2", name = "Date") +
+  labs(x = "Distance (mm)", y = "Absorbance (254 nm)") +
+  coord_cartesian(xlim = c(0, 75)) +
+  theme(legend.position = "right",
+        legend.key.size = unit(0.4, "cm"))
+```
+
+### Normalized profiles with peak identification
+
+After Platosome-guided normalization, profiles are x-aligned (anchored on free and 80S) and y-scaled (by total area). Each identified peak is marked.
+
+```{r}
+#| label: normalized-with-peaks
+#| fig-width: 11
+#| fig-height: 5.5
+#| fig-cap: "Normalized profiles with Platosome-identified peaks. Vertical lines mark detected (solid) and inferred (dashed) peak modes. The free and 80S peaks are tightly aligned by construction; other peaks show residual spread due to gradient nonlinearity."
+
+# Compute normalized peak positions
+fits_norm <- fits |>
+  group_by(identifier) |>
+  mutate(
+    src_free = mode[peak == "free"][1],
+    src_80s = mode[peak == "80S"][1],
+    src_ruler = src_80s - src_free
+  ) |>
+  ungroup()
+
+# Use the reference profile's peaks for normalization target
+ref_id <- unique(fits$identifier)[1]
+ref_free <- fits |> filter(identifier == ref_id, peak == "free") |> pull(mode)
+ref_80s <- fits |> filter(identifier == ref_id, peak == "80S") |> pull(mode)
+ref_ruler <- ref_80s - ref_free
+
+fits_norm <- fits_norm |>
+  mutate(
+    scale = ref_ruler / src_ruler,
+    offset = ref_free - src_free * scale,
+    mode_norm = mode * scale + offset
+  )
+
+ggplot() +
+  geom_line(data = data,
+            aes(x = distance.normalized, y = absorbance.normalized,
+                group = identifier),
+            alpha = 0.2, linewidth = 0.25, color = "steelblue4") +
+  geom_vline(data = fits_norm |> filter(peak %in% peak_order),
+             aes(xintercept = mode_norm, color = peak,
+                 linetype = method),
+             alpha = 0.35, linewidth = 0.35) +
+  scale_color_manual(values = peak_colors, name = "Peak") +
+  scale_linetype_manual(values = c("detected" = "solid", "inferred" = "dashed"),
+                        name = "Method") +
+  labs(x = "Distance (mm, normalized)", y = "Absorbance (normalized)") +
+  coord_cartesian(xlim = c(0, 70))
+```
+
+## The 40S Problem: Quantifying Absent Peaks
+
+The 40S subunit peak is biologically important but often too weak to detect by conventional peak-finding. Without the Platosome, it would simply be missed, biasing any downstream quantification.
+
+The Platosome knows where to look: at position `r sprintf("%.3f", platosome$peaks[["40S"]]$position_relative)` ruler units (between free and 60S). When no local maximum is found in this region, the Platosome *infers* a peak at the expected position with reduced confidence (0.4), enabling consistent quantification across all samples.
+
+```{r}
+#| label: 40S-showcase
+#| fig-width: 11
+#| fig-height: 7
+#| fig-cap: "40S detection across all samples. Top: three example profiles zoomed to the 40S region, showing detected (solid orange) vs inferred (dashed orange) cases. Bottom: 40S fitted height across all samples, colored by detection method. Inferred peaks tend to have lower amplitude but are still quantifiable."
+
+fits_40S <- fits |>
+  filter(peak == "40S") |>
+  arrange(method, height) |>
+  mutate(sample_rank = row_number())
+
+# Pick examples: one strong detection, one weak, one inferred
+examples <- bind_rows(
+  fits_40S |> filter(method == "detected") |> slice_max(height, n = 1),
+  fits_40S |> filter(method == "detected") |> slice_min(height, n = 1),
+  fits_40S |> filter(method == "inferred") |> slice(1)
+)
+
+example_data <- data |>
+  filter(identifier %in% examples$identifier)
+
+# Platosome expected region
+search_min <- 0.412 - 2 * 0.035  # position_relative +/- 2*SD
+search_max <- 0.412 + 2 * 0.035
+
+p_profiles <- ggplot() +
+  geom_line(data = example_data,
+            aes(x = distance, y = absorbance),
+            color = "gray30", linewidth = 0.5) +
+  geom_vline(data = examples,
+             aes(xintercept = mode, linetype = method),
+             color = peak_colors["40S"], linewidth = 0.8) +
+  # Shade platosome search region (approximate)
+  geom_rect(data = example_data |> distinct(identifier) |>
+              left_join(fits |> filter(peak %in% c("free", "80S")) |>
+                          select(identifier, peak, mode) |>
+                          pivot_wider(names_from = peak, values_from = mode),
+                        by = "identifier") |>
+              mutate(ruler = `80S` - free,
+                     xmin = free + search_min * ruler,
+                     xmax = free + search_max * ruler),
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+            fill = peak_colors["40S"], alpha = 0.08) +
+  scale_linetype_manual(values = c("detected" = "solid", "inferred" = "dashed")) +
+  facet_wrap(~identifier, ncol = 1, scales = "free_y") +
+  labs(x = "Distance (mm)", y = "Absorbance") +
+  coord_cartesian(xlim = c(5, 30)) +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 8))
+
+p_amplitudes <- fits_40S |>
+  ggplot(aes(x = sample_rank, y = height, fill = method)) +
+  geom_col(width = 0.8, alpha = 0.8) +
+  scale_fill_manual(values = c("detected" = peak_colors["40S"],
+                                "inferred" = "gray60"),
+                    name = "Method") +
+  labs(x = "Sample (ranked by height)", y = "40S peak height") +
+  theme(legend.position = "bottom")
+
+# Combine
+library(patchwork)
+p_profiles / p_amplitudes + plot_layout(heights = c(3, 1.2))
+```
+
+```{r}
+#| label: 40S-summary
+
+fits_40S_summary <- fits_40S |>
+  group_by(method) |>
+  summarise(
+    n = n(),
+    `Mean height` = sprintf("%.4f", mean(height)),
+    `SD height` = sprintf("%.4f", sd(height)),
+    `Mean R2` = if ("r_squared" %in% names(fits_40S)) sprintf("%.3f", mean(r_squared, na.rm = TRUE)) else "N/A",
+    .groups = "drop"
+  )
+
+knitr::kable(fits_40S_summary,
+             caption = "40S peak quantification by detection method")
+```
+
+## Local Step Ratios: Handling Gradient Nonlinearity
+
+A single affine transform (anchored on free and 80S) corrects the x-axis globally but cannot account for nonlinear gradient behavior. In the polysome region, peaks systematically compress as sucrose concentration increases.
+
+The Platosome captures this with **local step ratios**: each peak's position is predicted from the spacing of its two immediate predecessors.
+
+$$\text{predicted}(n{+}1) = \text{pos}(n) + r \times [\text{pos}(n) - \text{pos}(n{-}1)]$$
+
+where $r$ is the empirically estimated ratio.
+
+```{r}
+#| label: step-ratios
+#| fig-width: 11
+#| fig-height: 5
+#| fig-cap: "Local step ratios from the Platosome. Each bar shows the mean ratio +/- 1 SD, with the predecessor triplet labeled. A ratio of 1.0 means equal spacing; < 1 means compression. The 80S-to-disome gap is 1.6x the 60S-to-80S gap; subsequent steps compress to 0.73x, consistent with gradient nonlinearity at higher sucrose concentrations."
+
+triplets <- list(
+  "2-some" = c("60S", "80S"),
+  "3-some" = c("80S", "2-some"),
+  "4-some" = c("2-some", "3-some"),
+  "5-some" = c("3-some", "4-some"),
+  "6-some" = c("4-some", "5-some")
+)
+
+step_data <- tibble(
+  peak = names(triplets),
+  ratio = map_dbl(names(triplets), ~platosome$peaks[[.x]]$local_step_ratio),
+  ratio_sd = map_dbl(names(triplets), ~platosome$peaks[[.x]]$local_step_ratio_sd),
+  n = map_int(names(triplets), ~platosome$peaks[[.x]]$local_step_n),
+  pre_pre = map_chr(names(triplets), ~triplets[[.x]][1]),
+  pre = map_chr(names(triplets), ~triplets[[.x]][2])
+) |>
+  mutate(
+    peak = factor(peak, levels = peak),
+    label = paste0(pre_pre, " -> ", pre, " -> ", peak)
+  )
+
+ggplot(step_data, aes(x = peak, y = ratio, fill = peak)) +
+  geom_hline(yintercept = 1.0, linetype = "dashed", color = "gray50", linewidth = 0.4) +
+  geom_col(alpha = 0.7, width = 0.6) +
+  geom_errorbar(aes(ymin = ratio - ratio_sd, ymax = ratio + ratio_sd),
+                width = 0.2, linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", ratio)), vjust = -0.5, size = 3.5) +
+  geom_text(aes(y = 0.05, label = paste0("n=", n)), size = 2.8, color = "white") +
+  scale_fill_manual(values = peak_colors) +
+  labs(x = NULL, y = "Step ratio (spacing / predecessor spacing)") +
+  coord_cartesian(ylim = c(0, 2.2)) +
+  theme(legend.position = "none")
+```
+
+### Polysome spacing in practice
+
+The plot below shows actual inter-peak distances across all samples. In a perfectly linear gradient, all polysomes would be equally spaced; the systematic decrease in spacing is the nonlinearity the Platosome captures.
+
+```{r}
+#| label: spacing-empirical
+#| fig-width: 11
+#| fig-height: 5
+#| fig-cap: "Measured inter-peak spacing for each sample. Connected lines show the progression from 80S-to-2-some through 5-some-to-6-some. The downward trend reflects gradient nonlinearity; the Platosome's local step ratios model this compression."
+
+spacing_pairs <- list(
+  "80S - 2" = c("80S", "2-some"),
+  "2 - 3" = c("2-some", "3-some"),
+  "3 - 4" = c("3-some", "4-some"),
+  "4 - 5" = c("4-some", "5-some"),
+  "5 - 6" = c("5-some", "6-some")
+)
+
+spacing_data <- fits |>
+  filter(method == "detected", confidence >= 0.9) |>
+  select(identifier, peak, mode) |>
+  pivot_wider(names_from = peak, values_from = mode)
+
+spacing_long <- map_dfr(names(spacing_pairs), function(pair_name) {
+  p <- spacing_pairs[[pair_name]]
+  if (!all(p %in% names(spacing_data))) return(tibble())
+  spacing_data |>
+    filter(!is.na(.data[[p[1]]]), !is.na(.data[[p[2]]])) |>
+    transmute(identifier,
+              pair = pair_name,
+              spacing = .data[[p[2]]] - .data[[p[1]]])
+}) |>
+  mutate(pair = factor(pair, levels = names(spacing_pairs)))
+
+ggplot(spacing_long, aes(x = pair, y = spacing)) +
+  geom_line(aes(group = identifier), alpha = 0.15, color = "gray40") +
+  geom_point(aes(color = pair), alpha = 0.4, size = 1.5) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.4,
+               color = "black", linewidth = 0.6) +
+  scale_color_manual(values = c(
+    "80S - 2" = peak_colors["2-some"],
+    "2 - 3" = peak_colors["3-some"],
+    "3 - 4" = peak_colors["4-some"],
+    "4 - 5" = peak_colors["5-some"],
+    "5 - 6" = peak_colors["6-some"]
+  )) +
+  labs(x = "Peak pair", y = "Spacing (mm)") +
+  theme(legend.position = "none")
+```
+
+## The Polysome Envelope: Beyond Individual Peaks
+
+Above the 4-some, individual peaks often cannot be resolved. The Platosome addresses this with a **polysome region envelope** --- the average shape of the signal from 80S onward, normalized to 80S peak height.
+
+The envelope is computed in ruler-relative coordinates (where 80S = 1.0) so it is portable across gradients. At each position, the Platosome stores the mean signal and its standard deviation across all `r platosome$envelope$envelope_n_total` training profiles.
+
+```{r}
+#| label: envelope
+#| fig-width: 11
+#| fig-height: 5
+#| fig-cap: "Polysome region envelope. Gray band: mean +/- 1 SD across all training profiles. Individual colored lines: a few example profiles in ruler-relative coordinates. The envelope captures the typical signal decay and can serve as a reference for normalizing the high-polysome region even when individual peaks are not resolvable."
+
+env_x <- unlist(platosome$envelope$envelope_x)
+env_mean <- as.numeric(ifelse(sapply(platosome$envelope$envelope_mean, is.null),
+                                NA, platosome$envelope$envelope_mean))
+env_sd <- as.numeric(ifelse(sapply(platosome$envelope$envelope_sd, is.null),
+                              NA, platosome$envelope$envelope_sd))
+env_n <- as.integer(unlist(platosome$envelope$envelope_n))
+
+df_envelope <- tibble(x = env_x, mean = env_mean, sd = env_sd, n = env_n) |>
+  filter(!is.na(mean), n >= 5)
+
+# Get a few example profiles in ruler-relative coords
+example_ids <- c(
+  fits |> filter(peak == "6-some", method == "detected") |> slice(1) |> pull(identifier),
+  fits |> filter(peak == "5-some", method == "detected") |>
+    filter(!identifier %in% (fits |> filter(peak == "6-some", method == "detected") |> pull(identifier))) |>
+    slice(1) |> pull(identifier),
+  unique(fits$identifier)[1]
+)
+
+example_envelopes <- data |>
+  filter(identifier %in% example_ids) |>
+  left_join(
+    fits |>
+      filter(peak %in% c("free", "80S")) |>
+      select(identifier, peak, mode, height, baseline) |>
+      pivot_wider(names_from = peak, values_from = c(mode, height, baseline)),
+    by = "identifier"
+  ) |>
+  mutate(
+    ruler = mode_80S - mode_free,
+    x_rel = (distance - mode_free) / ruler,
+    peak_h = height_80S - baseline_80S,
+    y_rel = (absorbance - baseline_80S) / peak_h
+  ) |>
+  filter(x_rel >= 1.0, x_rel <= 3.0)
+
+# Mark expected peak positions in ruler-relative units
+poly_positions <- tibble(
+  peak = c("80S", "2-some", "3-some", "4-some", "5-some", "6-some"),
+  x_rel = map_dbl(c("80S", "2-some", "3-some", "4-some", "5-some", "6-some"),
+                   ~platosome$peaks[[.x]]$position_relative)
+)
+
+ggplot() +
+  # Envelope band
+  geom_ribbon(data = df_envelope,
+              aes(x = x, ymin = mean - sd, ymax = mean + sd),
+              fill = "gray70", alpha = 0.5) +
+  geom_line(data = df_envelope, aes(x = x, y = mean),
+            color = "gray30", linewidth = 0.6) +
+  # Example profiles
+  geom_line(data = example_envelopes,
+            aes(x = x_rel, y = y_rel, color = identifier),
+            alpha = 0.6, linewidth = 0.4) +
+  # Peak position markers
+  geom_vline(data = poly_positions,
+             aes(xintercept = x_rel),
+             linetype = "dotted", color = "gray50", alpha = 0.5) +
+  geom_text(data = poly_positions,
+            aes(x = x_rel, y = max(df_envelope$mean + df_envelope$sd, na.rm = TRUE) * 1.05,
+                label = peak),
+            size = 2.8, color = "gray40") +
+  scale_color_brewer(palette = "Dark2", name = "Sample") +
+  labs(x = "Position (ruler-relative units; 80S = 1.0)",
+       y = "Signal (fraction of 80S peak height)") +
+  coord_cartesian(ylim = c(-0.1, NA)) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7))
+```
+
+### Envelope coverage
+
+The envelope is constructed from all `r platosome$envelope$envelope_n_total` profiles, but coverage decreases at higher polysome positions as signal drops into noise:
+
+```{r}
+#| label: envelope-coverage
+#| fig-width: 9
+#| fig-height: 3.5
+#| fig-cap: "Number of training profiles contributing to the envelope at each position. All 39 contribute through the disome region; coverage remains complete through the grid because signal-end detection is per-profile."
+
+tibble(x = env_x, n = env_n) |>
+  ggplot(aes(x = x, y = n)) +
+  geom_area(fill = "steelblue", alpha = 0.4) +
+  geom_line(color = "steelblue4", linewidth = 0.5) +
+  geom_vline(data = poly_positions,
+             aes(xintercept = x_rel),
+             linetype = "dotted", color = "gray50", alpha = 0.6) +
+  geom_text(data = poly_positions,
+            aes(x = x_rel, y = max(env_n) * 1.05, label = peak),
+            size = 2.5, color = "gray40") +
+  labs(x = "Position (ruler-relative units)", y = "Contributing samples") +
+  coord_cartesian(ylim = c(0, max(env_n) * 1.1))
+```
+
+## Empirical Templates vs Parametric Fits
+
+The Platosome stores both parametric (skew-normal) descriptions and empirical shape templates for each peak. The goodness-of-fit (R^2^) reveals where the skew-normal is adequate and where it falls short:
+
+```{r}
+#| label: template-r2
+#| fig-width: 9
+#| fig-height: 4
+#| fig-cap: "Skew-normal goodness-of-fit by peak type. 80S is nearly perfectly described by the skew-normal (R2 = 0.998). Polysome peaks, especially 4-some and 5-some, are poorly fit --- their empirical templates capture structure that the parametric model misses."
+
+template_stats <- tibble(
+  peak = peak_order,
+  r2_mean = map_dbl(peak_order, ~{
+    v <- platosome$peaks[[.x]]$fit_r2_mean
+    if (is.null(v)) NA_real_ else v
+  }),
+  r2_sd = map_dbl(peak_order, ~{
+    v <- platosome$peaks[[.x]]$fit_r2_sd
+    if (is.null(v)) NA_real_ else v
+  }),
+  n = map_int(peak_order, ~{
+    v <- platosome$peaks[[.x]]$template_n
+    if (is.null(v)) 0L else as.integer(v)
+  })
+) |>
+  filter(!is.na(r2_mean)) |>
+  mutate(peak = factor(peak, levels = peak_order))
+
+ggplot(template_stats, aes(x = peak, y = r2_mean, fill = peak)) +
+  geom_col(alpha = 0.7, width = 0.6) +
+  geom_errorbar(aes(ymin = r2_mean - r2_sd, ymax = pmin(r2_mean + r2_sd, 1.0)),
+                width = 0.2, linewidth = 0.5) +
+  geom_text(aes(label = sprintf("n=%d", n)), y = 0.05, size = 2.8, color = "white") +
+  geom_hline(yintercept = 0.9, linetype = "dashed", color = "gray50") +
+  scale_fill_manual(values = peak_colors) +
+  labs(x = NULL, y = expression(R^2 ~ "(skew-normal vs empirical)")) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  theme(legend.position = "none")
+```
+
+## Polysome Fraction Quantification
+
+The central biological quantity of interest: **what fraction of RNA is in polysomes?** Using the normalized profiles and detected peak positions, we can integrate the signal from the post-80S trough onward and express it as a proportion of total signal. This polysome fraction reflects translational activity --- higher values mean more ribosomes are actively translating.
+
+```{r}
+#| label: polysome-fraction
+
+# Parse conditions from filenames
+# Patterns:
+#   1-20231116_BY4742_30C.csv  -> strain=BY4742, temp=30
+#   10-20240419_BY4742_40.csv  -> strain=BY4742, temp=40
+#   25-2025_1_28_C1_WH.csv    -> non-standard, exclude
+#   28-C1_SH_mock_PFA_052325.csv -> non-standard, exclude
+#   34-C1_SH_30_012126.csv    -> strain=SH, temp=30
+#   37-C4_BY4741_30_012126.csv -> strain=BY4741, temp=30
+
+parse_condition <- function(id) {
+  # Try standard format: number-date_strain_temp[C].csv
+  m <- str_match(id, "^\\d+-\\d{8}_(\\w+)_(\\d+)C?\\.csv$")
+  if (!is.na(m[1,1])) return(tibble(strain = m[1,2], temp = as.integer(m[1,3])))
+
+  # Try: number-C#_strain_temp_date.csv (e.g. 34-C1_SH_30_012126.csv)
+  m <- str_match(id, "^\\d+-C\\d+_(\\w+?)_(\\d+)_\\d+\\.csv$")
+  if (!is.na(m[1,1])) return(tibble(strain = m[1,2], temp = as.integer(m[1,3])))
+
+  return(tibble(strain = NA_character_, temp = NA_integer_))
+}
+
+conditions <- tibble(identifier = unique(data$identifier)) |>
+  bind_cols(map_dfr(unique(data$identifier), parse_condition))
+
+# Get 80S and 2-some mode positions per sample (using normalized coordinates)
+trough_bounds <- fits |>
+  filter(peak %in% c("80S", "2-some"), method == "detected") |>
+  select(identifier, peak, mode) |>
+  pivot_wider(names_from = peak, values_from = mode) |>
+  rename(mode_80S = `80S`, mode_2some = `2-some`) |>
+  filter(!is.na(mode_80S), !is.na(mode_2some))
+
+# For each sample, find the trough (minimum absorbance between 80S and 2-some)
+# and integrate polysome fraction
+polysome_fractions <- trough_bounds |>
+  inner_join(conditions, by = "identifier") |>
+  filter(!is.na(strain), !is.na(temp)) |>
+  rowwise() |>
+  mutate(
+    trough_pos = {
+      d <- data |> filter(identifier == .env$identifier,
+                          distance >= mode_80S, distance <= mode_2some)
+      if (nrow(d) < 3) mode_80S + (mode_2some - mode_80S) / 2
+      else d$distance[which.min(d$absorbance)]
+    },
+    area_polysome = {
+      d <- data |> filter(identifier == .env$identifier,
+                          distance >= trough_pos, distance <= 85)
+      if (nrow(d) < 3) NA_real_
+      else sum(diff(d$distance) * (pmax(d$absorbance[-nrow(d)], 0) + pmax(d$absorbance[-1], 0)) / 2)
+    },
+    area_total = {
+      d <- data |> filter(identifier == .env$identifier, distance <= 85)
+      if (nrow(d) < 3) NA_real_
+      else sum(diff(d$distance) * (pmax(d$absorbance[-nrow(d)], 0) + pmax(d$absorbance[-1], 0)) / 2)
+    },
+    polysome_pct = area_polysome / area_total * 100
+  ) |>
+  ungroup() |>
+  filter(!is.na(polysome_pct))
+```
+
+```{r}
+#| label: polysome-fraction-plot
+#| fig-width: 10
+#| fig-height: 5.5
+#| fig-cap: "Polysome fraction (% of total absorbance from post-80S trough onward) by temperature and strain. Each point is one profile. Higher polysome fractions indicate more active translation."
+
+polysome_fractions |>
+  mutate(temp_label = paste0(temp, "\u00b0C")) |>
+  ggplot(aes(x = factor(temp), y = polysome_pct, color = strain)) +
+  geom_jitter(width = 0.15, size = 2.5, alpha = 0.7) +
+  stat_summary(aes(group = strain), fun = mean, geom = "crossbar",
+               width = 0.3, linewidth = 0.5, alpha = 0.6,
+               position = position_dodge(width = 0.4)) +
+  scale_color_brewer(palette = "Set2", name = "Strain") +
+  labs(
+    x = "Temperature (\u00b0C)",
+    y = "Polysome fraction (% total signal)",
+    title = "Polysome Fraction by Condition"
+  ) +
+  theme(legend.position = "right")
+```
+
+```{r}
+#| label: polysome-fraction-table
+
+polysome_fractions |>
+  group_by(strain, temp) |>
+  summarise(
+    n = n(),
+    mean = mean(polysome_pct),
+    sd = sd(polysome_pct),
+    .groups = "drop"
+  ) |>
+  arrange(strain, temp) |>
+  mutate(
+    `Polysome %` = ifelse(is.na(sd),
+                          sprintf("%.1f%%", mean),
+                          sprintf("%.1f%% \u00b1 %.1f%%", mean, sd)),
+    Temperature = paste0(temp, "\u00b0C")
+  ) |>
+  select(Strain = strain, Temperature, n, `Polysome %`) |>
+  knitr::kable(caption = "Polysome fraction by strain and temperature")
+```
+
+## Summary
+
+The Platosome provides a principled framework for polysome profile normalization:
+
+| Component | What it captures | Where it helps |
+|-----------|-----------------|----------------|
+| **Ruler** (free -> 80S) | Global gradient scale | Affine x-alignment |
+| **Peak templates** | Empirical peak shapes | Detection & quality assessment |
+| **Local step ratios** | Gradient nonlinearity | Polysome region x-alignment |
+| **Polysome envelope** | High-polysome signal shape | Normalization beyond resolvable peaks |
+| **Detection priors** | Expected positions + rates | Quantifying weak/absent peaks (40S) |
+
+The current Platosome (v`r platosome$version`) is estimated from `r platosome$n_samples` profiles. As the dataset grows, the Platosome's estimates will tighten, and its ability to normalize diverse experimental conditions will improve.
